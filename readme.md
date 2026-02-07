@@ -1,109 +1,120 @@
-# 基于 Akshare 的 MCP 服务
+# akshare_mcp
 
-编写一个基于 akshare 的 MCP 趋势分析服务。MCP (Model Context Protocol) 的核心优势在于让大模型（LLM）具备“实时获取信息”和“执行特定动作”的能力。
+基于 `baostock + akshare` 的 MCP 服务，面向 A 股长期持有与低频交易分析。
 
-本服务面向低频交易者或基本面投资者，不需要像量化高频（HFT）那样追求毫秒级的行情，服务更需要的是数据的广度、关联性分析以及基本面的快速提取。AkShare 恰好是一个数据源极其丰富的库（覆盖股票、期货、宏观数据等）。
+## 设计原则
 
-大模型作为“金融架构师”，设计了一套既符合低频/价值投资逻辑，又适合 LLM 理解与调用的 MCP 服务架构。
+1. 单一工具入口：每个功能只保留一个 tool。
+2. 数据源优先级：`baostock` 优先；能力缺失时 `akshare fallback`。
+3. 低频优先：围绕周/月级决策，不追求高频撮合。
+4. LLM 友好：输出尽量为精简表格和摘要，控制 token。
 
-## 一、 整体设计理念：AI 投资助理 (The AI Junior Analyst)
+## 功能地图
 
-本服务不是一个自动交易机器，而是一个**“不知疲倦的初级分析师”**。
+### A. 基础数据层（baostock）
 
-当用户在 Chat 界面（如gemini-cli, cursor, claude code/desktop）问：“最近茅台跌这么多，是因为财报不好还是板块问题？”时，MCP 应该能自动拆解问题：
+- `get_current_time`：服务器时间
+- `get_stock_basic`：证券基础信息
+- `get_stock_kdata`：股票历史 K 线（d/w/m/分钟）
+- `get_industry_info`：行业分类映射
+- `get_dividend_info`：分红派息数据
+- `get_profit_info`：季度盈利能力
+- `get_operation_info`：季度营运能力
+- `get_growth_info`：季度成长能力
+- `get_index_data`：指数历史 K 线
+- `get_valuation_info`：PE/PB/PS/PCF 时序
 
-1. 调用接口查贵州茅台的近期股价走势。
-2. 调用接口查白酒板块资金流向。
-3. 调用接口查茅台最近发布的财报摘要或新闻。
+### B. 市场与个股分析层
 
-## 二、 系统架构图
+- `get_market_indices`：三大指数市场概览（baostock -> akshare）
+- `get_sector_fund_flow`：行业资金流（akshare）
+- `get_north_fund_flow`：北向资金汇总（akshare）
+- `get_stock_spot`：个股最新行情快照（baostock -> akshare）
+- `get_financial_analysis`：财务指标摘要（baostock -> akshare）
+- `get_valuation_status`：5 年 PE 分位估值结论（baostock -> akshare）
+- `get_stock_news`：个股新闻（akshare）
+- `get_dragon_tiger_list`：龙虎榜（akshare）
 
-架构的核心在于中间的“数据清洗层”。AkShare 返回的往往是巨大的 Pandas DataFrame，直接丢给 LLM 会消耗大量 Token 且容易由于格式混乱导致幻觉。
+### C. 长期持有量化层
 
-- 接入层 (MCP Server): 处理 JSON-RPC 请求，暴露 Tools 和 Resources。
-- 适配层 (Adapter): 将 AkShare 的 DataFrame 转化为精简的 Markdown 表格或 JSON 摘要。
-- 缓存层 (Caching): 关键点。AkShare 很多接口是爬虫，速度慢且容易被封。对于财务数据、日线数据，必须做本地缓存（如 SQLite 或 Redis）。
+- `get_grid_strategy`：网格交易计划（baostock -> akshare）
+- `get_long_term_factor_score`：长期多因子评分（估值/质量/成长/分红）
+- `get_low_freq_backtest`：低频回测（月度定投 + 手续费）
+- `get_portfolio_rebalance_plan`：组合再平衡（等权/逆波动）
+- `get_value_candidates_and_grid`：围绕锚点股票筛选同类低估标的并输出各自网格计划（支持硬约束：估值分位/ROE/负债率/分红年限/市值相似度/波动率）
+  - 返回包含：约束配置、候选评分表、入选原因、每只股票的网格计划
 
-## 三、 核心接口设计 (Tools)
+## 典型工作流
 
-对于低频交易，我们将接口分为四大类：市场全景、个股透视、基本面体检、消息舆情。
+### 工作流 1：长期选股初筛
 
-### 1. 市场全景类 (Market Overview)
+1. `get_long_term_factor_score`
+2. `get_financial_analysis`
+3. `get_valuation_status`
 
-*解决问题：现在的市场环境是冷是热？大盘在涨还是跌？*
+### 工作流 2：单票长期持有验证
 
-- `get_market_indices` (大盘指数)
-    - 描述： 获取上证指数、深证成指、创业板指的当日涨跌幅、成交量。
-    - AkShare 映射： `stock_zh_index_spot_sina`
-    - 用途： AI 判断当前是牛市、熊市还是震荡市。
+1. `get_stock_kdata`
+2. `get_low_freq_backtest`
+3. `get_stock_news`（解释近期异常波动）
 
-- `get_sector_fund_flow` (板块资金流)
-    - 描述： 获取今日资金净流入前十和后十的行业板块。
-    - AkShare 映射： `stock_individual_fund_flow_rank` (需聚合) 或 东方财富板块资金流接口。
-    - 用途： 识别市场热点（如：最近是不是都在炒AI？还是在防御性买入银行？）。
+### 工作流 3：组合月度调仓
 
-- `get_north_fund_flow` (北向资金 - 即使现在不再实时披露，日度数据仍重要)
-    - 描述： 获取沪股通、深股通的净买入额。
-    - 用途： 外资（聪明的钱）的态度。
+1. `get_portfolio_rebalance_plan`
+2. `get_market_indices`
+3. `get_sector_fund_flow`
 
-### 2. 个股透视类 (Stock Deep Dive)
+## 运行方式
 
-*解决问题：这只股票现在的价格位置在哪里？*
+### 安装依赖
 
-- `get_stock_spot` (实时/最新行情)
-    - 参数： 股票代码 (symbol)
-    - 描述： 获取最新价、涨跌幅、换手率、市盈率(TTM)、总市值。
-    - 用途： 基础报价。
+```bash
+pip install -r requirements.txt
+```
 
-- `get_stock_history_kline` (历史K线)
-    - 参数： 股票代码, 周期 (daily/weekly), start_date, end_date
-    - 描述： 获取开盘、收盘、最高、最低、成交量。
-    - 重要处理： 不要返回几千行数据。通常只返回最近 N 天，或者让 LLM 总结趋势。
-    - 用途： 技术面分析，判断是否处于支撑位或阻力位。
+### 查看工具列表
 
-### 3. 基本面体检类 (Fundamental Analysis)
-*解决问题：这是一家好公司吗？这是低频交易的核心。*
+```bash
+python a_share_value_mcp.py -h
+```
 
-- `get_financial_analysis` (主要财务指标)
-    - 参数： 股票代码
-    - 描述： 获取最近 3 年的营收增长率、净利润增长率、ROE (净资产收益率)、毛利率、资产负债率。
-    - AkShare 映射： `stock_financial_analysis_indicator`
-    - 用途： 价值投资判断，排除垃圾股。
+### 启动 MCP Server
 
-- `get_dividend_history` (分红记录)
-    - 参数： 股票代码
-    - 描述： 获取过去几年的分红送转情况。
-    - 用途： 这是一个低频/长线投资者非常看重的指标（股息率）。
+```bash
+python a_share_value_mcp.py
+```
 
-4. 消息与特色数据 (News & Alpha)
-*解决问题：有没有雷？有没有榜？*
-- `get_stock_news` (个股新闻)
-    - 参数： 股票代码
-    - 描述： 获取该股票最近 5 条重要新闻标题和摘要。
-    - AkShare 映射： `stock_news_em` (东方财富个股新闻)
-    - 用途： 舆情监控，解释股价异常波动。
+## 项目结构
 
-`get_dragon_tiger_list` (龙虎榜)
-    - 参数： 日期
-    - 描述： 查询某股票是否上榜，以及机构席位的买卖情况。
-    - 用途： 判断是否有游资或机构在大举进出。
+```text
+aksh-mcp/
+├─ a_share_value_mcp.py      # MCP 入口与工具注册（轻量 wrapper）
+├─ models/
+│  └─ inputs.py              # 枚举与全部输入模型
+├─ core/
+│  └─ utils.py               # 通用工具函数（格式化、打分、权重处理等）
+├─ data/
+│  ├─ baostock_client.py     # baostock 访问封装
+│  └─ market_data.py         # 价格序列获取（baostock 优先 + akshare fallback）
+├─ tools/
+│  ├─ stock.py               # 基础证券与行情类工具实现
+│  ├─ market.py              # 市场概览与新闻类工具实现
+│  ├─ fundamental.py         # 基本面与估值类工具实现
+│  └─ strategy.py            # 策略/回测/再平衡类工具实现
+└─ readme.md
+```
 
-### 四、 开发注意
-作为一个不做量化的开发者，在开发这个 MCP 时要注意以下几点：
+## 参数规范
 
-1. 代码标准化 (Symbol Normalization):
-    - AkShare 的接口有的需要 `600000` ，有的需要 `sh600000`。
-    - 建议： 在 MCP 入口处做一个工具函数，统一接受 6 位数字代码，内部自动根据接口要求加前缀后缀。
+- 股票代码建议使用 6 位数字（如 `600519`），内部自动规范化。
+- 日期支持 `YYYYMMDD` 或 `YYYY-MM-DD`。
+- 长期分析默认使用较长回看窗口；如需更快响应可缩小范围。
 
-2. 数据裁剪 (Token Economy):
-    - LLM 的上下文窗口有限且昂贵。AkShare 拉下来的财报数据表可能有 50 列。
-    - 建议： 只保留核心字段（营收、净利、扣非净利、ROE、负债率）。不要把什么“少数股东权益”这种冷门字段扔给 LLM，除非你专门在查这个。
+## 错误处理
 
-3. 错误处理 (Error Handling):
-    - AkShare 本质是爬虫，如果东方财富网页改版，接口就会挂。
-    - 建议： 你的 MCP 必须捕获异常，并返回人类可读的错误信息（例如：“数据源暂时不可用”），而不是抛出一堆 Python Traceback 给 LLM。
+- 工具统一通过 `handle_error` 返回可读错误信息。
+- 当主数据源失败时，优先尝试 fallback；若仍失败，返回明确错误原因。
 
-4. Prompt 友好性:
-- 在定义 MCP Tool 的 `description` 时，要写得非常详细。
-- 坏: "获取股票K线."
-- 好: "获取股票的历史K线数据。用于分析股价趋势、支撑位和阻力位。如果是长线分析，建议获取周线(weekly)。" -> 这能引导 LLM 更智能地使用工具。
+## 后续重构建议
+
+建议下一阶段将单文件拆分为多模块（`models/`, `services/`, `tools/`），降低耦合并提升可维护性。
