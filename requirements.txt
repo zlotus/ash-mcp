@@ -1,0 +1,5 @@
+akshare
+mcp[cli]
+pandas
+pydantic
+httpx
