@@ -1,4 +1,4 @@
-akshare
+baostock
 mcp[cli]
 pandas
 pydantic
