@@ -3,3 +3,6 @@ mcp[cli]
 pandas
 pydantic
 httpx
+loguru
+akshare
+tabulate

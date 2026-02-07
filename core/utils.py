@@ -1,14 +1,21 @@
-import logging
+import json
+import os
+import sys
 from datetime import datetime
 from math import sqrt
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from loguru import logger
 
 from models.inputs import AdjustType, KlinePeriod, ResponseFormat, normalize_symbol
 
+# Configure loguru
+logger.remove()  # Remove default handler
+logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
+logger.add("mcp.log", rotation="10 MB", retention="10 days", level="INFO")
 
-logger = logging.getLogger("akshare_mcp")
+STRATEGY_CACHE_PATH = "prefetch-file-server/data/strategy_cache.json"
 
 
 BAOSTOCK_FREQUENCY_MAP = {
@@ -91,7 +98,7 @@ def trim_dataframe(df: pd.DataFrame, max_rows: int = 20, columns: Optional[List[
 
 
 def handle_error(e: Exception, tool_name: str) -> str:
-    logger.error(f"Error in {tool_name}: {str(e)}", exc_info=True)
+    logger.exception(f"Error in {tool_name}: {str(e)}")
     return f"Error: Data source temporarily unavailable or invalid request. Details: {str(e)}"
 
 
@@ -188,3 +195,22 @@ def apply_weight_cap(raw_weights: pd.Series, max_single_weight: float) -> pd.Ser
         return weights / weights.sum()
     weights[under] = weights[under] / under_sum * remain
     return weights / weights.sum()
+
+
+def load_cache(file_path: str) -> Dict[str, Any]:
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(file_path: str, data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass

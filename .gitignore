@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
+*.log
 .env
 .vscode/
+prefetch-file-server/

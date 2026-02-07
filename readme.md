@@ -118,3 +118,5 @@ aksh-mcp/
 ## 后续重构建议
 
 建议下一阶段将单文件拆分为多模块（`models/`, `services/`, `tools/`），降低耦合并提升可维护性。
+
+ 0 1 * * * cd /home/wsl/quant/ash-mcp && /home/wsl/miniconda3/envs/quant/bin/python3 prefetch_strategy.py >> prefetch.log 2>&1

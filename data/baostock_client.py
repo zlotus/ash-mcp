@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Tuple
 
 import baostock as bs
 import pandas as pd
+from loguru import logger
 
 from core.utils import (
     normalize_bs_adjust,
@@ -26,6 +27,7 @@ def ensure_baostock_login() -> None:
     if getattr(login_result, "error_code", "-1") != "0":
         raise RuntimeError(f"baostock login failed: {getattr(login_result, 'error_msg', 'unknown error')}")
     _baostock_logged_in = True
+    logger.info("Baostock login successful.")
 
 
 def baostock_result_to_df(result: Any) -> pd.DataFrame:

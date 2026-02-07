@@ -193,7 +193,8 @@ async def get_portfolio_rebalance_plan(params: PortfolioRebalanceInput) -> str:
 
 @mcp.tool(name="get_value_candidates_and_grid")
 async def get_value_candidates_and_grid(params: ValueCandidatesGridInput) -> str:
-    """围绕锚点股票筛选同类低估标的，并输出每只股票的长期佛系网格计划。支持估值/质量/分红/市值相似度/波动率硬约束，并返回入选原因。"""
+    """以锚点股票为基准，在全市场（或同行业）筛选具备相似市值规模、高ROE、稳定分红且处于估值低位的优质蓝筹标的。
+    支持行业动态负债率约束、波动率硬约束，并输出每只入选股票的长期佛系网格计划。适合寻找跨行业的‘核心资产’。"""
     return await get_value_candidates_and_grid_impl(params)
 
 

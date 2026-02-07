@@ -5,16 +5,21 @@ import akshare as ak
 import baostock as bs
 import pandas as pd
 
+from loguru import logger
+
 from core.utils import (
+    STRATEGY_CACHE_PATH,
     apply_weight_cap,
     clamp_score,
     compute_equity_metrics,
     format_data,
     handle_error,
+    load_cache,
     normalize_bs_code,
     parse_symbol_list,
     parse_weight_map,
     percentile_of_last,
+    save_cache,
     to_yyyymmdd,
     trim_dataframe,
 )
@@ -249,6 +254,13 @@ async def get_portfolio_rebalance_plan_impl(params: PortfolioRebalanceInput) -> 
 
 async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -> str:
     try:
+        today = datetime.now().strftime("%Y%m%d")
+        cache = load_cache(STRATEGY_CACHE_PATH)
+        
+        # Initialize daily cache if not present
+        if today not in cache:
+            cache = {today: {"cap_map": {}, "metrics": {}}}
+
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=365 * params.lookback_years + 20)).strftime("%Y%m%d")
         anchor_market_cap = None
@@ -256,269 +268,274 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
         def _to_float(v: Any) -> float:
             return float(pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0])
 
-        # 1) Build candidate universe around anchor industry (Ping An-style financials by default).
+        # 1) Build candidate universe.
         anchor_code = normalize_bs_code(params.anchor_symbol)
         anchor_ind_df = query_baostock_table(bs.query_stock_industry, code=anchor_code)
         anchor_industry = ""
         if not anchor_ind_df.empty and "industry" in anchor_ind_df.columns:
             anchor_industry = str(anchor_ind_df.iloc[0].get("industry", "") or "")
 
-        all_ind = query_baostock_table(bs.query_stock_industry)
-        if all_ind.empty:
-            raise RuntimeError("Industry mapping is empty.")
-
-        if anchor_industry:
-            same_ind = all_ind[all_ind["industry"] == anchor_industry] if "industry" in all_ind.columns else pd.DataFrame()
+        if params.strict_same_industry and anchor_industry:
+            all_ind = query_baostock_table(bs.query_stock_industry)
+            candidates_df = all_ind[all_ind["industry"] == anchor_industry].copy()
         else:
-            same_ind = pd.DataFrame()
-
-        candidates_df = same_ind
-        if params.strict_same_industry and not candidates_df.empty:
-            pass
-        elif candidates_df.empty or len(candidates_df) < params.top_n:
-            keywords = ["保险", "银行", "证券", "多元金融", "金融"]
-            if "industry" in all_ind.columns:
-                mask = all_ind["industry"].astype(str).str.contains("|".join(keywords), na=False)
-                candidates_df = all_ind[mask]
-
-        if candidates_df.empty:
-            candidates_df = all_ind
+            try:
+                hs300 = query_baostock_table(bs.query_hs300_stocks)
+                zz500 = query_baostock_table(bs.query_zz500_stocks)
+                candidates_df = pd.concat([hs300, zz500]).drop_duplicates(subset=["code"])
+            except Exception:
+                candidates_df = query_baostock_table(bs.query_stock_industry)
+            
+            candidates_df = candidates_df.sample(frac=1).reset_index(drop=True)
 
         code_col = "code" if "code" in candidates_df.columns else None
         name_col = "code_name" if "code_name" in candidates_df.columns else None
         if not code_col:
-            raise RuntimeError("Industry data missing code column.")
+            raise RuntimeError("Industry/Index data missing code column.")
 
-        candidate_rows: List[Dict[str, Any]] = []
-        seen = set()
+        ind_map = {}
+        if "industry" in candidates_df.columns:
+            for _, r in candidates_df.iterrows():
+                ind_map[str(r[code_col])] = str(r.get("industry", ""))
+
+        # Market Cap Map Caching
+        cap_map = cache[today].get("cap_map", {})
+        if not cap_map:
+            logger.info("Market cap cache miss. Fetching from AKShare...")
+            try:
+                spot_df = ak.stock_zh_a_spot_em()
+                if not spot_df.empty and "代码" in spot_df.columns and "总市值" in spot_df.columns:
+                    for _, r in spot_df.iterrows():
+                        sym = str(r.get("代码", "")).strip()
+                        cap_val = _to_float(r.get("总市值"))
+                        if pd.notna(cap_val) and cap_val > 0:
+                            cap_map[sym] = cap_val
+                    cache[today]["cap_map"] = cap_map
+                    save_cache(STRATEGY_CACHE_PATH, cache)
+                    logger.success("Market cap cache updated.")
+            except Exception as e:
+                logger.error(f"Failed to update market cap cache: {e}")
+        else:
+            logger.info("Market cap cache hit.")
+
+        potential_codes = []
         for _, row in candidates_df.iterrows():
             code = str(row.get(code_col, "")).strip().lower()
             if not code or code == anchor_code:
                 continue
             symbol = code.split(".")[-1]
-            if symbol in seen:
-                continue
-            seen.add(symbol)
-            candidate_rows.append({
+            
+            mcap = cap_map.get(symbol, 0)
+            ratio = mcap / anchor_market_cap if anchor_market_cap else 1.0
+            
+            if anchor_market_cap:
+                if not (params.market_cap_ratio_min <= ratio <= params.market_cap_ratio_max):
+                    continue
+            
+            industry = row.get("industry", ind_map.get(code, ""))
+            if not industry:
+                try:
+                    ind_res = query_baostock_table(bs.query_stock_industry, code=code)
+                    if not ind_res.empty:
+                        industry = str(ind_res.iloc[0].get("industry", ""))
+                except Exception:
+                    industry = "Unknown"
+
+            potential_codes.append({
                 "symbol": symbol,
                 "name": str(row.get(name_col, "")) if name_col else "",
-                "industry": str(row.get("industry", "")),
+                "industry": industry,
+                "market_cap": mcap,
+                "cap_ratio": ratio,
             })
-            if len(candidate_rows) >= params.candidate_limit:
+            if len(potential_codes) >= params.candidate_limit:
                 break
 
-        if not candidate_rows:
-            raise RuntimeError("No candidates found from industry mapping.")
+        if not potential_codes:
+            return f"No candidates found matching market cap scale ({params.market_cap_ratio_min}-{params.market_cap_ratio_max}x of anchor)."
 
-        cap_map: Dict[str, float] = {}
-        try:
-            spot_df = ak.stock_zh_a_spot_em()
-            if not spot_df.empty and "代码" in spot_df.columns and "总市值" in spot_df.columns:
-                for _, r in spot_df.iterrows():
-                    sym = str(r.get("代码", "")).strip()
-                    if not sym:
-                        continue
-                    cap_val = _to_float(r.get("总市值"))
-                    if pd.notna(cap_val) and cap_val > 0:
-                        cap_map[sym] = cap_val
-                anchor_market_cap = cap_map.get(params.anchor_symbol)
-        except Exception:
-            cap_map = {}
-
-        # 2) Score candidates for undervaluation + quality.
+        # 2) Score candidates for quality and value.
         scored: List[Dict[str, Any]] = []
-        for c in candidate_rows:
+        metrics_cache = cache[today].get("metrics", {})
+        cache_updated = False
+
+        for c in potential_codes:
             symbol = c["symbol"]
+            
+            # Check Metrics Cache
+            if symbol in metrics_cache:
+                m = metrics_cache[symbol]
+                logger.debug(f"Cache hit for {symbol}")
+                # Check if it passes filters (filters are dynamic based on params)
+                is_financial = any(k in c["industry"] for k in ["银行", "保险", "证券", "金融"])
+                effective_max_debt = 92.0 if is_financial else params.max_debt_ratio
+                
+                pass_filters = (
+                    m["pe_pct"] <= params.max_pe_percentile
+                    and m["pb_pct"] <= params.max_pb_percentile
+                    and m["roe"] >= params.min_roe
+                    and m["debt"] <= effective_max_debt
+                    and m["yoy_ni"] >= params.min_yoy_net_profit
+                    and m["dividend_years_5y"] >= params.min_dividend_years_5y
+                    and m["annual_vol"] <= params.max_annual_volatility
+                )
+                if pass_filters:
+                    scored.append({**c, **m, "is_financial": is_financial, "hard_pass": True})
+                continue
+            
+            logger.info(f"Cache miss for {symbol}. Fetching live metrics...")
             try:
-                val_df = query_baostock_history(
+                # Value indicators (Baostock)
+                val_df_raw = query_baostock_history(
                     symbol=symbol,
-                    fields=["date", "code", "close", "peTTM", "pbMRQ"],
+                    fields=["date", "peTTM", "pbMRQ", "close"],
                     start_date=start_date,
                     end_date=end_date,
                     period=KlinePeriod.DAILY.value,
                     adjust=AdjustType.NONE.value,
                 )
-                if val_df.empty or "peTTM" not in val_df.columns:
+                if val_df_raw.empty or "peTTM" not in val_df_raw.columns:
                     continue
-                pe_series = pd.to_numeric(val_df["peTTM"], errors="coerce")
-                pe_series = pe_series[(pe_series > 0) & pe_series.notna()]
-                if pe_series.empty:
-                    continue
-
-                pb_series = pd.to_numeric(val_df["pbMRQ"], errors="coerce")
-                pb_series = pb_series[(pb_series > 0) & pb_series.notna()]
+                
+                pe_series = pd.to_numeric(val_df_raw["peTTM"], errors="coerce").dropna()
+                pe_series = pe_series[pe_series > 0]
+                if pe_series.empty: continue
                 pe_pct = percentile_of_last(pe_series)
-                pb_pct = percentile_of_last(pb_series) if not pb_series.empty else 50.0
-                value_score = clamp_score((100 - pe_pct) * 0.6 + (100 - pb_pct) * 0.4)
+                curr_pe = pe_series.iloc[-1]
 
-                profit_row, _ = latest_quarter_row(symbol, bs.query_profit_data)
+                pb_series = pd.to_numeric(val_df_raw["pbMRQ"], errors="coerce").dropna()
+                pb_series = pb_series[pb_series > 0]
+                pb_pct = percentile_of_last(pb_series) if not pb_series.empty else 50.0
+
+                # Quality indicators (Baostock)
+                profit_row, p_period = latest_quarter_row(symbol, bs.query_profit_data)
                 balance_row, _ = latest_quarter_row(symbol, bs.query_balance_data)
                 growth_row, _ = latest_quarter_row(symbol, bs.query_growth_data)
-                roe = float(pd.to_numeric(pd.Series([profit_row.get("roeAvg")]), errors="coerce").iloc[0])
-                debt = float(pd.to_numeric(pd.Series([balance_row.get("liabilityToAsset")]), errors="coerce").iloc[0])
-                yoy_ni = float(pd.to_numeric(pd.Series([growth_row.get("YOYNI")]), errors="coerce").iloc[0])
-                quality_score = clamp_score(clamp_score(roe * 4) * 0.6 + clamp_score(100 - debt) * 0.4)
-                growth_score = clamp_score((yoy_ni + 20) * 2)
-                total_score = clamp_score(value_score * 0.5 + quality_score * 0.35 + growth_score * 0.15)
+                
+                q_num = int(p_period[-1]) if p_period and p_period[-1].isdigit() else 4
+                roe_raw = _to_float(profit_row.get("roeAvg"))
+                roe_annual = roe_raw * (4 / q_num) * 100
+                
+                a2e = _to_float(balance_row.get("assetToEquity"))
+                debt = (1 - (1 / a2e)) * 100 if a2e > 1 else _to_float(balance_row.get("liabilityToAsset")) * 100
+                
+                yoy_ni = _to_float(growth_row.get("YOYNI")) * 100
+                
+                is_financial = any(k in c["industry"] for k in ["银行", "保险", "证券", "金融"])
+                effective_max_debt = 92.0 if is_financial else params.max_debt_ratio
 
-                dividend_years = 0
-                current_year = datetime.now().year
-                for year in range(current_year - 4, current_year + 1):
+                # Dividend consistency (Baostock)
+                div_years = 0
+                cy = datetime.now().year
+                for yr in range(cy - 4, cy + 1):
                     try:
-                        ddf = query_baostock_table(
-                            bs.query_dividend_data,
-                            code=normalize_bs_code(symbol),
-                            year=str(year),
-                            yearType="report",
-                        )
-                        if ddf.empty or "dividCashPsBeforeTax" not in ddf.columns:
-                            continue
-                        dv = pd.to_numeric(ddf["dividCashPsBeforeTax"], errors="coerce").dropna()
-                        if not dv.empty and float(dv.iloc[0]) > 0:
-                            dividend_years += 1
+                        ddf = query_baostock_table(bs.query_dividend_data, code=normalize_bs_code(symbol), year=str(yr), yearType="report")
+                        if not ddf.empty and _to_float(ddf.iloc[0].get("dividCashPsBeforeTax")) > 0:
+                            div_years += 1
                     except Exception:
                         continue
 
-                hard_pass = (
+                # Risk/Volatility (Baostock HFQ)
+                val_df_hfq = query_baostock_history(symbol=symbol, fields=["date", "close"], start_date=start_date, end_date=end_date, period=KlinePeriod.DAILY.value, adjust=AdjustType.HFQ.value)
+                close_hfq = pd.to_numeric(val_df_hfq["close"], errors="coerce").dropna()
+                ret = close_hfq.pct_change().dropna()
+                annual_vol = float(ret.std() * (252 ** 0.5))
+
+                # Scoring
+                value_score = clamp_score((100 - pe_pct) * 0.6 + (100 - pb_pct) * 0.4)
+                quality_score = clamp_score(clamp_score(roe_annual * 4) * 0.7 + clamp_score(100 - debt) * 0.3)
+                growth_score = clamp_score(yoy_ni + 50)
+                total_score = clamp_score(value_score * 0.4 + quality_score * 0.4 + (div_years * 20) * 0.2)
+
+                m_data = {
+                    "current_price": _to_float(val_df_raw["close"].iloc[-1] if "close" in val_df_raw.columns else val_df_hfq["close"].iloc[-1]),
+                    "current_pe": curr_pe,
+                    "pe_pct": pe_pct, "pb_pct": pb_pct,
+                    "roe": roe_annual, "debt": debt, "yoy_ni": yoy_ni,
+                    "dividend_years_5y": div_years, "annual_vol": annual_vol,
+                    "value_score": value_score, "quality_score": quality_score,
+                    "growth_score": growth_score, "total_score": total_score
+                }
+                
+                # Update Cache
+                metrics_cache[symbol] = m_data
+                cache_updated = True
+
+                pass_filters = (
                     pe_pct <= params.max_pe_percentile
                     and pb_pct <= params.max_pb_percentile
-                    and roe >= params.min_roe
-                    and debt <= params.max_debt_ratio
+                    and roe_annual >= params.min_roe
+                    and debt <= effective_max_debt
                     and yoy_ni >= params.min_yoy_net_profit
-                    and dividend_years >= params.min_dividend_years_5y
+                    and div_years >= params.min_dividend_years_5y
+                    and annual_vol <= params.max_annual_volatility
                 )
-                if not hard_pass:
-                    continue
-
-                close_series = pd.to_numeric(val_df["close"], errors="coerce").dropna()
-                if close_series.empty:
-                    continue
-                current_price = float(close_series.iloc[-1])
-                ret = close_series.pct_change().dropna()
-                annual_vol = float(ret.std() * (252 ** 0.5)) if not ret.empty else float("nan")
-                market_cap = cap_map.get(symbol)
-                cap_ratio = (
-                    float(market_cap / anchor_market_cap)
-                    if (market_cap and anchor_market_cap and anchor_market_cap > 0)
-                    else float("nan")
-                )
-
-                vol_ok = pd.notna(annual_vol) and annual_vol <= params.max_annual_volatility
-                cap_ok = True
-                if anchor_market_cap and anchor_market_cap > 0 and market_cap and market_cap > 0:
-                    cap_ok = params.market_cap_ratio_min <= cap_ratio <= params.market_cap_ratio_max
-                if not (vol_ok and cap_ok):
-                    continue
-                scored.append({
-                    **c,
-                    "current_price": current_price,
-                    "pe_pct": pe_pct,
-                    "pb_pct": pb_pct,
-                    "value_score": value_score,
-                    "quality_score": quality_score,
-                    "growth_score": growth_score,
-                    "total_score": total_score,
-                    "current_pe": float(pe_series.iloc[-1]),
-                    "roe": roe,
-                    "debt": debt,
-                    "yoy_ni": yoy_ni,
-                    "dividend_years_5y": dividend_years,
-                    "market_cap": market_cap,
-                    "cap_ratio": cap_ratio,
-                    "annual_vol": annual_vol,
-                    "hard_pass": "YES" if hard_pass else "NO",
-                })
+                if pass_filters:
+                    scored.append({**c, **m_data, "is_financial": is_financial, "hard_pass": True})
             except Exception:
                 continue
 
+        if cache_updated:
+            cache[today]["metrics"] = metrics_cache
+            save_cache(STRATEGY_CACHE_PATH, cache)
+
         if not scored:
-            return "No undervalued candidates found with current filters."
+            return "No candidates found matching the high-quality blue-chip filters. Consider relaxing ROE or PE percentile requirements."
 
-        scored_df = pd.DataFrame(scored).sort_values(
-            by=["value_score", "total_score"], ascending=[False, False]
-        ).head(params.top_n)
-
+        scored_df = pd.DataFrame(scored).sort_values(by="total_score", ascending=False).head(params.top_n)
         picks = scored_df.to_dict(orient="records")
+        
         summary = scored_df.rename(columns={
-            "symbol": "Symbol",
-            "name": "Name",
-            "industry": "Industry",
-            "current_price": "Current Price",
-            "current_pe": "Current PE",
-            "pe_pct": "PE Percentile(%)",
-            "pb_pct": "PB Percentile(%)",
-            "roe": "ROE(%)",
-            "debt": "Debt Ratio(%)",
-            "yoy_ni": "YoY Net Profit(%)",
-            "dividend_years_5y": "Dividend Years (5Y)",
-            "market_cap": "Market Cap",
-            "cap_ratio": "MCap/Anchor",
-            "annual_vol": "Annual Vol",
-            "value_score": "Value Score",
-            "quality_score": "Quality Score",
-            "growth_score": "Growth Score",
-            "total_score": "Total Score",
-            "hard_pass": "Hard Filter Pass",
+            "symbol": "Symbol", "name": "Name", "industry": "Industry",
+            "current_price": "Current Price", "current_pe": "Current PE",
+            "pe_pct": "PE Pct(%)", "pb_pct": "PB Pct(%)",
+            "roe": "ROE(%)", "debt": "Debt(%)", "yoy_ni": "YoY Profit(%)",
+            "dividend_years_5y": "DivYears(5Y)", "market_cap": "MCap",
+            "cap_ratio": "MCap/Anchor", "annual_vol": "Vol",
+            "value_score": "ValScore", "quality_score": "QualScore",
+            "growth_score": "GrowScore", "total_score": "Score",
+            "hard_pass": "Pass"
         })[[
             "Symbol", "Name", "Industry", "Current Price", "Current PE",
-            "PE Percentile(%)", "PB Percentile(%)",
-            "ROE(%)", "Debt Ratio(%)", "YoY Net Profit(%)", "Dividend Years (5Y)",
-            "Market Cap", "MCap/Anchor", "Annual Vol",
-            "Value Score", "Quality Score", "Growth Score", "Total Score",
-            "Hard Filter Pass",
+            "PE Pct(%)", "PB Pct(%)", "ROE(%)", "Debt(%)", "YoY Profit(%)", 
+            "DivYears(5Y)", "MCap", "MCap/Anchor", "Vol",
+            "ValScore", "QualScore", "GrowScore", "Score", "Pass"
         ]]
+        
         for col in [
-            "Current Price", "Current PE", "PE Percentile(%)", "PB Percentile(%)",
-            "ROE(%)", "Debt Ratio(%)", "YoY Net Profit(%)",
-            "Market Cap", "MCap/Anchor", "Annual Vol",
-            "Value Score", "Quality Score", "Growth Score", "Total Score",
+            "Current Price", "Current PE", "PE Pct(%)", "PB Pct(%)",
+            "ROE(%)", "Debt(%)", "YoY Profit(%)", "MCap", "MCap/Anchor", "Vol",
+            "ValScore", "QualScore", "GrowScore", "Score"
         ]:
             summary[col] = pd.to_numeric(summary[col], errors="coerce").round(2)
 
         cfg_df = pd.DataFrame([{
             "Anchor": params.anchor_symbol,
             "Anchor Industry": anchor_industry or "N/A",
-            "Strict Same Industry": params.strict_same_industry,
+            "Strict": params.strict_same_industry,
             "Top N": params.top_n,
-            "Max PE Percentile": params.max_pe_percentile,
-            "Max PB Percentile": params.max_pb_percentile,
-            "Min ROE(%)": params.min_roe,
-            "Max Debt Ratio(%)": params.max_debt_ratio,
-            "Min YoY Net Profit(%)": params.min_yoy_net_profit,
-            "Min Dividend Years (5Y)": params.min_dividend_years_5y,
-            "MCap Ratio Min": params.market_cap_ratio_min,
-            "MCap Ratio Max": params.market_cap_ratio_max,
-            "Max Annual Vol": params.max_annual_volatility,
+            "Max PE%": params.max_pe_percentile,
+            "Min ROE": params.min_roe,
+            "MCap Min": params.market_cap_ratio_min,
+            "MCap Max": params.market_cap_ratio_max,
         }])
 
         result = format_data(cfg_df, title="Selection Constraints")
-        result += "\n\n" + format_data(
-            summary,
-            title=f"Value Candidates Similar to {params.anchor_symbol} (Top {len(picks)})",
-        )
+        result += "\n\n" + format_data(summary, title=f"Value Candidates Similar to {params.anchor_symbol}")
 
         reasons: List[Dict[str, Any]] = []
         for item in picks:
             tags: List[str] = []
-            if float(item.get("pe_pct", 100)) <= 30:
-                tags.append("PE分位低")
-            if float(item.get("pb_pct", 100)) <= 30:
-                tags.append("PB分位低")
-            if float(item.get("roe", 0)) >= 12:
-                tags.append("ROE较高")
-            if float(item.get("dividend_years_5y", 0)) >= 4:
-                tags.append("分红稳定")
-            if float(item.get("annual_vol", 9)) <= 0.35:
-                tags.append("波动较低")
-            if not tags:
-                tags.append("综合评分达标")
-            reasons.append({
-                "Symbol": item.get("symbol"),
-                "Why Selected": "、".join(tags),
-            })
+            if float(item.get("pe_pct", 100)) <= 30: tags.append("PE分位低")
+            if float(item.get("pb_pct", 100)) <= 30: tags.append("PB分位低")
+            if float(item.get("roe", 0)) >= 12: tags.append("ROE较高")
+            if float(item.get("dividend_years_5y", 0)) >= 4: tags.append("分红稳定")
+            if float(item.get("annual_vol", 9)) <= 0.35: tags.append("波动较低")
+            if not tags: tags.append("综合评分达标")
+            reasons.append({"Symbol": item.get("symbol"), "Why Selected": "、".join(tags)})
         result += "\n\n" + format_data(pd.DataFrame(reasons), title="Selection Reasons")
 
-        # 3) Build grid strategy for each selected stock.
+        # 3) Build grid strategy for each selected stock (Baostock only)
         for item in picks:
             symbol = str(item["symbol"])
             current_price = float(item["current_price"])
@@ -531,23 +548,12 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
                     end_date=end_date,
                     period=KlinePeriod.DAILY.value,
                     adjust=AdjustType.HFQ.value,
-                )
-                hdf = hdf.tail(params.history_days)
-                if hdf.empty:
-                    raise RuntimeError("empty history")
+                ).tail(params.history_days)
+                if hdf.empty: continue
                 year_high = float(pd.to_numeric(hdf["high"], errors="coerce").dropna().max())
                 year_low = float(pd.to_numeric(hdf["low"], errors="coerce").dropna().min())
             except Exception:
-                hdf = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period="daily",
-                    start_date=start_grid,
-                    adjust="hfq",
-                ).tail(params.history_days)
-                if hdf.empty:
-                    continue
-                year_high = float(pd.to_numeric(hdf["最高"], errors="coerce").dropna().max())
-                year_low = float(pd.to_numeric(hdf["最低"], errors="coerce").dropna().min())
+                continue
 
             grids = []
             p = current_price
@@ -558,18 +564,17 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
                     "Level": f"Buy #{i}",
                     "Buy Price": round(buy_price, 2),
                     "Sell Target": round(sell_target, 2),
-                    "Distance from Current": f"-{round(i * params.grid_step_pct * 100, 1)}%",
+                    "Dist.": f"-{round(i * params.grid_step_pct * 100, 1)}%",
                 })
                 p = buy_price
 
-            header_df = pd.DataFrame([{
+            ctx_df = pd.DataFrame([{
                 "Symbol": symbol,
-                "Current Price": round(current_price, 2),
-                "Range Low": round(year_low, 2),
-                "Range High": round(year_high, 2),
-                "Grid Step(%)": round(params.grid_step_pct * 100, 2),
+                "Price": round(current_price, 2),
+                "Range": f"{round(year_low, 2)} - {round(year_high, 2)}",
+                "Step(%)": round(params.grid_step_pct * 100, 2),
             }])
-            result += "\n\n" + format_data(header_df, title=f"Grid Context for {symbol}")
+            result += "\n\n" + format_data(ctx_df, title=f"Grid Context for {symbol}")
             result += "\n\n" + format_data(pd.DataFrame(grids), title=f"Grid Plan for {symbol}")
 
         return result
