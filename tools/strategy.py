@@ -259,7 +259,7 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
         
         # Initialize daily cache if not present
         if today not in cache:
-            cache = {today: {"cap_map": {}, "metrics": {}}}
+            cache[today] = {"cap_map": {}, "metrics": {}, "industry_map": {}, "financial_cache": {}}
 
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=365 * params.lookback_years + 20)).strftime("%Y%m%d")
@@ -297,26 +297,75 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
         if "industry" in candidates_df.columns:
             for _, r in candidates_df.iterrows():
                 ind_map[str(r[code_col])] = str(r.get("industry", ""))
+        industry_map_cache = cache[today].get("industry_map", {})
 
-        # Market Cap Map Caching
+        # Market-cap estimation is cache-first: cap_map -> financial_cache(total_share) + latest close.
         cap_map = cache[today].get("cap_map", {})
-        if not cap_map:
-            logger.info("Market cap cache miss. Fetching from AKShare...")
-            try:
-                spot_df = ak.stock_zh_a_spot_em()
-                if not spot_df.empty and "代码" in spot_df.columns and "总市值" in spot_df.columns:
-                    for _, r in spot_df.iterrows():
-                        sym = str(r.get("代码", "")).strip()
-                        cap_val = _to_float(r.get("总市值"))
-                        if pd.notna(cap_val) and cap_val > 0:
-                            cap_map[sym] = cap_val
-                    cache[today]["cap_map"] = cap_map
-                    save_cache(STRATEGY_CACHE_PATH, cache)
-                    logger.success("Market cap cache updated.")
-            except Exception as e:
-                logger.error(f"Failed to update market cap cache: {e}")
-        else:
+        financial_cache = cache[today].get("financial_cache", {})
+        if cap_map:
             logger.info("Market cap cache hit.")
+        else:
+            logger.info("Market cap cache miss. Runtime will rely on financial_cache and skip heavy downloads.")
+
+        def _estimate_market_cap(symbol_like: str) -> float:
+            sym = str(symbol_like).split(".")[-1].strip()
+            if not sym:
+                return 0.0
+            cached = _to_float(cap_map.get(sym))
+            if pd.notna(cached) and cached > 0:
+                logger.debug(f"[cap_map] hit for {sym}")
+                return cached
+            logger.debug(f"[cap_map] miss for {sym}")
+
+            fin_cached = financial_cache.get(sym, {})
+            fin_period_cached = str(fin_cached.get("financial_period", ""))
+            if ("total_share" in fin_cached) and (not bool(fin_cached.get("unavailable"))):
+                ts_cached = _to_float(fin_cached.get("total_share"))
+                if pd.isna(ts_cached) or ts_cached <= 0:
+                    financial_cache[sym] = {
+                        "financial_period": fin_period_cached,
+                        "total_share": None,
+                        "unavailable": True,
+                    }
+                    logger.debug(f"[financial_cache] normalized invalid total_share -> unavailable for {sym}")
+                    return 0.0
+            if bool(fin_cached.get("unavailable")):
+                logger.debug(f"[financial_cache] unavailable flag hit for {sym}, skip re-download")
+                return 0.0
+            total_share_cached = _to_float(fin_cached.get("total_share"))
+            if pd.notna(total_share_cached) and total_share_cached > 0:
+                logger.debug(f"[financial_cache] hit total_share for {sym}")
+                try:
+                    px_df = query_baostock_history(
+                        symbol=sym,
+                        fields=["date", "close"],
+                        start_date=(datetime.now() - timedelta(days=20)).strftime("%Y%m%d"),
+                        end_date=end_date,
+                        period=KlinePeriod.DAILY.value,
+                        adjust=AdjustType.NONE.value,
+                    )
+                    if not px_df.empty and "close" in px_df.columns:
+                        close_series = pd.to_numeric(px_df["close"], errors="coerce").dropna()
+                        if not close_series.empty:
+                            latest_close = float(close_series.iloc[-1])
+                            mcap = latest_close * total_share_cached
+                            if pd.notna(mcap) and mcap > 0:
+                                cap_map[sym] = float(mcap)
+                                logger.info(f"[cap_map] updated from financial_cache+price for {sym}")
+                                return float(mcap)
+                except Exception as e:
+                    logger.debug(f"Market cap estimate (financial_cache path) failed for {sym}: {e}")
+            else:
+                logger.debug(f"[financial_cache] miss total_share for {sym}")
+
+            logger.debug(f"[financial_cache] no usable total_share for {sym}, skip runtime market-cap download")
+            return 0.0
+
+        anchor_market_cap = _estimate_market_cap(anchor_code)
+        if anchor_market_cap > 0:
+            logger.info(f"Anchor market cap estimated for {anchor_code}: {anchor_market_cap:.2f}")
+        else:
+            logger.warning(f"Anchor market cap unavailable for {anchor_code}; cap-ratio filter will be skipped.")
 
         potential_codes = []
         for _, row in candidates_df.iterrows():
@@ -325,7 +374,7 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
                 continue
             symbol = code.split(".")[-1]
             
-            mcap = cap_map.get(symbol, 0)
+            mcap = _estimate_market_cap(symbol)
             ratio = mcap / anchor_market_cap if anchor_market_cap else 1.0
             
             if anchor_market_cap:
@@ -334,10 +383,14 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
             
             industry = row.get("industry", ind_map.get(code, ""))
             if not industry:
+                industry = industry_map_cache.get(code, "")
+            if not industry:
                 try:
                     ind_res = query_baostock_table(bs.query_stock_industry, code=code)
                     if not ind_res.empty:
                         industry = str(ind_res.iloc[0].get("industry", ""))
+                        if industry:
+                            industry_map_cache[code] = industry
                 except Exception:
                     industry = "Unknown"
 
@@ -350,6 +403,11 @@ async def get_value_candidates_and_grid_impl(params: ValueCandidatesGridInput) -
             })
             if len(potential_codes) >= params.candidate_limit:
                 break
+
+        cache[today]["cap_map"] = cap_map
+        cache[today]["industry_map"] = industry_map_cache
+        cache[today]["financial_cache"] = financial_cache
+        save_cache(STRATEGY_CACHE_PATH, cache)
 
         if not potential_codes:
             return f"No candidates found matching market cap scale ({params.market_cap_ratio_min}-{params.market_cap_ratio_max}x of anchor)."

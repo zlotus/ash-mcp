@@ -1,11 +1,11 @@
-# akshare_mcp
+# ash-mcp
 
 基于 `baostock + akshare` 的 MCP 服务，面向 A 股长期持有与低频交易分析。
 
 ## 设计原则
 
 1. 单一工具入口：每个功能只保留一个 tool。
-2. 数据源优先级：`baostock` 优先；能力缺失时 `akshare fallback`。
+2. 数据源优先级：在线查询以 `baostock` 为主；夜间预取允许使用 `akshare` 补齐缺失字段（如总股本）。
 3. 低频优先：围绕周/月级决策，不追求高频撮合。
 4. LLM 友好：输出尽量为精简表格和摘要，控制 token。
 
@@ -41,7 +41,7 @@
 - `get_long_term_factor_score`：长期多因子评分（估值/质量/成长/分红）
 - `get_low_freq_backtest`：低频回测（月度定投 + 手续费）
 - `get_portfolio_rebalance_plan`：组合再平衡（等权/逆波动）
-- `get_value_candidates_and_grid`：围绕锚点股票筛选同类低估标的并输出各自网格计划（支持硬约束：估值分位/ROE/负债率/分红年限/市值相似度/波动率）
+- `get_value_candidates_and_grid`：围绕锚点股票筛选同类低估标的并输出各自网格计划（支持硬约束：估值分位/ROE/负债率/分红年限/市值相似度/波动率；优先使用预取缓存）
   - 返回包含：约束配置、候选评分表、入选原因、每只股票的网格计划
 
 ## 典型工作流
@@ -84,11 +84,54 @@ python a_share_value_mcp.py -h
 python a_share_value_mcp.py
 ```
 
+### 夜间预取（推荐）
+
+```bash
+python prefetch_strategy.py
+```
+
+说明：
+
+- 预取内容：`industry_map`、`metrics`、`financial_cache`、`cap_map`。
+- `financial_cache.total_share` 优先来自 `baostock query_profit_data`，缺失时夜间再用 `akshare` 兜底。
+- 运行中会按固定进度 checkpoint，持续写入 `prefetch-file-server/data/strategy_cache.json`。
+
+### 缓存发布服务（可选）
+
+- 本仓只负责生成缓存文件：`prefetch-file-server/data/strategy_cache.json`。
+- 生产环境可使用独立服务（例如 Rust 实现的 `prefetch-file-server`）对该文件提供下载接口。
+- 该发布服务不属于本仓核心运行依赖，可以独立仓库维护并单独部署。
+
+### 预取调试日志（临时）
+
+```bash
+PREFETCH_DEBUG=1 python prefetch_strategy.py
+```
+
+说明：仅该次进程启用 DEBUG 级别，默认运行不受影响。
+
+### 预取进度日志速查
+
+预取脚本会输出类似：
+
+`[HS300] Progress: 120/300 | added=95 | cache_hit=20 | fetched=95 | skipped=5 | share_unavailable=3 | failed=0`
+
+字段含义：
+
+- `count/total`：已处理股票数 / 总股票数。
+- `added`：本次运行新增写入 `metrics` 的股票数量。
+- `cache_hit`：命中既有 `metrics` 缓存的股票数量。
+- `fetched`：本次实际完成计算并写入的股票数量（通常与 `added` 接近）。
+- `skipped`：因关键数据缺失（如估值序列为空）跳过的数量。
+- `share_unavailable`：无法得到有效总股本（`total_share`）的数量，会写 `unavailable: true`。
+- `failed`：请求或计算异常数量（可配合 DEBUG 日志排查具体 symbol）。
+
 ## 项目结构
 
 ```text
-aksh-mcp/
+ash-mcp/
 ├─ a_share_value_mcp.py      # MCP 入口与工具注册（轻量 wrapper）
+├─ prefetch_strategy.py       # 夜间缓存预取脚本（低频任务）
 ├─ models/
 │  └─ inputs.py              # 枚举与全部输入模型
 ├─ core/
@@ -114,9 +157,14 @@ aksh-mcp/
 
 - 工具统一通过 `handle_error` 返回可读错误信息。
 - 当主数据源失败时，优先尝试 fallback；若仍失败，返回明确错误原因。
+- 对 `financial_cache` 中不可用总股本会写 `unavailable: true`，避免重复无效请求。
 
 ## 后续重构建议
 
 建议下一阶段将单文件拆分为多模块（`models/`, `services/`, `tools/`），降低耦合并提升可维护性。
 
- 0 1 * * * cd /home/wsl/quant/ash-mcp && /home/wsl/miniconda3/envs/quant/bin/python3 prefetch_strategy.py >> prefetch.log 2>&1
+## 定时任务示例
+
+```cron
+0 1 * * * cd /home/wsl/quant/ash-mcp && /home/wsl/miniconda3/envs/quant/bin/python3 prefetch_strategy.py >> prefetch.log 2>&1
+```
