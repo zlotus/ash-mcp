@@ -90,11 +90,23 @@ pip install -r requirements.txt
 python a_share_value_mcp.py -h
 ```
 
-### 启动 MCP Server
+### Gemini JSON 配置（MCP）
 
-```bash
-python a_share_value_mcp.py
+将服务按 JSON 方式配置到 Gemini（示例）：
+
+```json
+{
+  "mcpServers": {
+    "ash-mcp": {
+      "command": "python",
+      "args": ["a_share_value_mcp.py"],
+      "cwd": "/home/wsl/quant/ash-mcp"
+    }
+  }
+}
 ```
+
+若你使用固定环境，也可把 `command` 改为绝对路径（例如 `/home/wsl/miniconda3/envs/quant/bin/python`）。
 
 ### 夜间预取（推荐）
 
