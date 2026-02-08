@@ -66,6 +66,18 @@
 
 ## 运行方式
 
+### 克隆仓库（含子模块）
+
+```bash
+git clone --recurse-submodules https://github.com/zlotus/ash-mcp.git
+```
+
+若已克隆主仓再补拉子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
 ### 安装依赖
 
 ```bash

@@ -3,4 +3,3 @@ __pycache__/
 *.log
 .env
 .vscode/
-prefetch-file-server/

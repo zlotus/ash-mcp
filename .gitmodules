@@ -1,0 +1,3 @@
+[submodule "prefetch-file-server"]
+	path = prefetch-file-server
+	url = https://github.com/zlotus/prefetch-file-server
